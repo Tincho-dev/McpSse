@@ -3,80 +3,88 @@ using System.ComponentModel;
 using System.Text.Json;
 using Microsoft.Extensions.Options;
 using ModelContextProtocol.Protocol;
+using ModelContextProtocol;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// Log to console (stderr) for debugging
-builder.Logging.AddConsole(options =>
-{
-    options.LogToStandardErrorThreshold = LogLevel.Trace;
-});
-
-// Register HttpContextAccessor and MCP server
-builder.Services.AddHttpContextAccessor();
-builder.Services.AddEndpointsApiExplorer();
-builder.Services.AddSwaggerGen()
-        .AddMcpServer()
-        .WithToolsFromAssembly(); ;
+builder.Services
+    .AddMcpServer()
+    .WithHttpTransport()
+    .WithToolsFromAssembly();
 
 var app = builder.Build();
 
-// Configure the HTTP request pipeline.
-if (app.Environment.IsDevelopment())
-{
-    app.UseSwagger();
-    app.UseSwaggerUI();
-}
-
-app.UseHttpsRedirection();
-
-app.MapGet("/", () => Results.Text("MCP SSE Server está en línea"))
-.WithOpenApi();
-
-// SSE endpoint for MCP
-app.MapGet("/sse", async context =>
-{
-    context.Response.Headers.ContentType = "text/event-stream";
-
-    // Create SSE transport using response stream
-    await using var transport = new SseResponseStreamTransport(
-        context.Response.Body,
-        "McpSse"
-    );
-
-    // Prepare server
-    var options = context.RequestServices.GetRequiredService<IOptions<McpServerOptions>>().Value;
-    var loggerFactory = context.RequestServices.GetService<ILoggerFactory>();
-    await using var server = McpServerFactory.Create(
-        transport,
-        options,
-        loggerFactory,
-        context.RequestServices
-    );
-
-    // Run transport and server
-    var transportTask = transport.RunAsync(context.RequestAborted);
-    await server.RunAsync(context.RequestAborted);
-    await transportTask;
-})
-.WithOpenApi();
-
-// POST endpoint to receive client messages
-app.MapPost("/message", async context =>
-{
-    var transport = context.RequestServices.GetRequiredService<SseResponseStreamTransport>();
-    var message = await context.Request.ReadFromJsonAsync<JsonRpcMessage>(
-        cancellationToken: context.RequestAborted
-    );
-    if (message != null)
-    {
-        await transport.OnMessageReceivedAsync(message, context.RequestAborted);
-        context.Response.StatusCode = StatusCodes.Status202Accepted;
-    }
-})
-.WithOpenApi();
+app.MapMcp();
 
 app.Run();
+
+
+static void MapAbsoluteEndpointUriMcp(IEndpointRouteBuilder endpoints)
+{
+    var loggerFactory = endpoints.ServiceProvider.GetRequiredService<ILoggerFactory>();
+    var options = endpoints.ServiceProvider.GetRequiredService<IOptions<McpServerOptions>>().Value;
+    var routeGroup = endpoints.MapGroup("");
+    SseResponseStreamTransport? session = null;
+
+    routeGroup.MapGet("/sse", async context =>
+    {
+        context.Response.Headers.ContentType = "text/event-stream";
+
+        // Construct the absolute base URI dynamically.
+        // var host = $"{context.Request.Scheme}://{context.Request.Host}";
+        var host = $"https://sse-mcp-gfhrb0aydyc8e3gf.canadacentral-01.azurewebsites.net";
+        var transport = new SseResponseStreamTransport(context.Response.Body, $"{host}/message");
+        session = transport;
+        try
+        {
+            await using (transport)
+            {
+                var transportTask = transport.RunAsync(context.RequestAborted);
+                await using var server = McpServerFactory.Create(transport, options, loggerFactory, endpoints.ServiceProvider);
+
+                try
+                {
+                    await server.RunAsync(context.RequestAborted);
+                }
+                catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested)
+                {
+                    // Normal SSE disconnect.
+                }
+                catch (Exception ex)
+                {
+                    // Handle other exceptions as needed.
+                }
+
+                await transportTask;
+            }
+        }
+        catch (Exception ex)
+        {
+
+        }
+    });
+
+    routeGroup.MapPost("/message", async context =>
+    {
+        if (session is null)
+        {
+            await Results.BadRequest("Session not started.").ExecuteAsync(context);
+            return;
+        }
+
+        var message = await context.Request.ReadFromJsonAsync<JsonRpcMessage>(
+            McpJsonUtilities.DefaultOptions, context.RequestAborted);
+        if (message is null)
+        {
+            await Results.BadRequest("No message in request body.").ExecuteAsync(context);
+            return;
+        }
+
+        await session.OnMessageReceivedAsync(message, context.RequestAborted);
+        context.Response.StatusCode = StatusCodes.Status202Accepted;
+        await context.Response.WriteAsync("Accepted");
+    });
+}
 
 
 [McpServerToolType]
