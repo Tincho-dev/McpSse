@@ -1,13 +1,12 @@
+// Program.cs
+using ModelContextProtocol.Server;
+using System.ComponentModel;
+
 var builder = WebApplication.CreateBuilder(args);
-
 builder.Services.AddMcpServer()
-                .WithHttpTransport()
-                .WithToolsFromAssembly();
-
+    .WithHttpTransport()
+    .WithToolsFromAssembly();
 var app = builder.Build();
-
-// Configure the HTTP request pipeline.
-app.UseHttpsRedirection();
 
 app.MapMcp();
 
